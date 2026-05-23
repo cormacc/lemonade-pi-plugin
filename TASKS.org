@@ -1,0 +1,100 @@
+* Upstream
+
+** TODO [#D] File upstream Pi issue: expose per-provider fetch hook or response-body interceptor :upstream:pi-extension-api:
+:PROPERTIES:
+:CUSTOM_ID: 962bd83e-aece-4280-aa9d-faa6c1421397
+:CREATED: [2026-05-26 Tue 20:34]
+:END:
+:LOGBOOK:
+- Created [2026-05-26 Tue 20:34]
+:END:
+File against https://github.com/earendil-works/pi/issues so the lemonade-pi-plugin can drop its `globalThis.fetch` wrapper. Verified against pi 0.75.4 source (`dist/core/extensions/types.d.ts` and `dist/providers/openai-completions.js` in the installed package).
+
+*** Draft issue title
+
+Extension API: expose a per-provider fetch hook or a body-aware response interceptor
+
+*** Draft issue body
+
+**** Problem
+
+Pi extensions that register a provider currently have no way to inspect the body of HTTP responses returned by that provider. This forces extensions that need to normalize malformed upstream responses to mutate `globalThis.fetch`, which is fragile and process-global.
+
+Concrete case: the [lemonade-pi-plugin](https://github.com/lemonade-sdk/lemonade-pi-plugin) registers a Lemonade local LLM server as an `openai-completions` provider. Some Lemonade builds return HTTP 200 with `Content-Type: text/event-stream` but a *raw JSON error body* (not SSE-framed) when the prompt exceeds context size:
+
+#+begin_src json
+{ "error": { "type": "exceed_context_size_error",
+             "code": 400,
+             "message": "request (16047 tokens) exceeds the available context size (4096 tokens)",
+             "n_prompt_tokens": 16047,
+             "n_ctx": 4096 } }
+#+end_src
+
+Pi's openai-completions consumer sees a stream that ends without `finish_reason` and surfaces `"Stream ended without finish_reason"`. The user gets a silent dead session and Pi's auto-compaction never fires because the error is never tagged with `context_length_exceeded`.
+
+To translate this into a proper exception (and prefix it with `context_length_exceeded:` so Pi auto-compacts), the plugin needs to read the response body. None of Pi's current extension hooks allow this.
+
+**** What we tried / why each option is insufficient
+
+Inventoried against pi 0.75.4 (`@earendil-works/pi-coding-agent` + `@earendil-works/pi-ai`):
+
+1. ~ProviderConfig.fetch~ — does not exist. ~ProviderConfig~ (`types.d.ts:939`) exposes `name`, `baseUrl`, `apiKey`, `api`, `streamSimple`, `headers`, `authHeader`, `models`, `oauth`. The OpenAI SDK itself supports a `fetch` option, but Pi's `createClient` (`providers/openai-completions.js:386`) constructs `new OpenAI({ apiKey, baseURL, dangerouslyAllowBrowser, defaultHeaders })` without forwarding one.
+
+2. ~after_provider_response~ event — fires, but its payload is `{ type, status, headers }` only (`types.d.ts:462`). The response body / stream is not passed to extensions, so a body-aware error normaliser cannot run here.
+
+3. ~before_provider_request~ event — request-side only; cannot observe responses.
+
+4. ~ProviderConfig.streamSimple~ — replaces the entire streaming implementation for the provider. Using it for a one-line body-inspection hook would mean reimplementing message conversion, tool-call handling, reasoning-content preservation, qwen-chat-template kwargs, cache handling, etc. Wrong granularity.
+
+5. Current workaround — wrap ~globalThis.fetch~. Functional, idempotent across module reloads via `Symbol.for`, scoped to a tracked URL set so foreign requests pass through unmodified. But it is still a process-global mutation that affects all code in the Pi process, which is a hygiene issue and hostile to other extensions that may want to do the same thing.
+
+**** Proposals (either would unblock the use case)
+
+***** (A) ~ProviderConfig.fetch~
+
+#+begin_src typescript
+export interface ProviderConfig {
+  // …existing fields…
+  /**
+   * Custom fetch implementation forwarded to the underlying provider client.
+   * Used to intercept request/response pairs for this provider only.
+   */
+  fetch?: typeof fetch;
+}
+#+end_src
+
+`openai-completions.ts` would forward it: `new OpenAI({ apiKey, baseURL, fetch, ... })`. The OpenAI SDK already accepts `fetch` in its client options, so the change in Pi is small.
+
+Pros: cleanest. Wrapper is scoped to a single provider, no global mutation, composable across multiple extensions.
+
+Cons: ties the surface to providers that internally use a fetch-based client. ~streamSimple~ providers would need their own pattern.
+
+***** (B) Extend ~AfterProviderResponseEvent~ with the body
+
+#+begin_src typescript
+export interface AfterProviderResponseEvent {
+  type: "after_provider_response";
+  status: number;
+  headers: Record<string, string>;
+  /**
+   * The raw response. Extensions can `clone()` and inspect the body to detect
+   * malformed upstream responses, then throw to abort the stream consumer.
+   */
+  response: Response;
+}
+#+end_src
+
+Pros: works for any provider implementation, not just OpenAI-compatible ones.
+
+Cons: Pi has to defer consuming the body until extensions are done with it (or pass a clone). Slightly more invasive.
+
+**** Acceptance criteria for either approach
+
+- Extension can register a provider whose responses are inspected without touching `globalThis.fetch`.
+- A test extension that wraps responses for ~provider A~ does not affect requests for ~provider B~ or for non-AI HTTP calls made elsewhere in the Pi process.
+- Existing providers continue to work with no config changes.
+
+**** References
+
+- lemonade-pi-plugin wrapper site: `extensions/index.ts` `installLemonadeFetchErrorWrapper` (current workaround we want to delete).
+- Related Pi types inspected: `dist/core/extensions/types.d.ts` (`ProviderConfig`, `AfterProviderResponseEvent`), `dist/providers/openai-completions.js` (`createClient`).

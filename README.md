@@ -11,6 +11,7 @@ After install, type `/login` in Pi then `subscription` and pick **Lemonade**, le
 - **HTTP fallback** — scans `localhost:13305`, `1234`, `9000`, `8080` if no beacon arrives.
 - **API key support** — prompted during login, stored by Pi in `~/.pi/agent/auth.json`, sent as `Authorization: Bearer …` on every request.
 - **Model admin** — `/lemonade` for status, list, load, unload, pull, delete, refresh, discover.
+- **Loaded context-window reporting** — for loaded Lemonade models, Pi's `contextWindow` uses `/api/v1/health` runtime `recipe_options.ctx_size` instead of the theoretical `/api/v1/models[].max_context_window`.
 
 ## Install
 
@@ -83,6 +84,12 @@ The connection details (`baseUrl`, `apiKey`, `serverName`) are encoded as JSON i
 
 The Pi-side API call goes through Lemonade's OpenAI-compatible `/v1/chat/completions` endpoint. The extension uses `api: "openai-completions"` in the provider config.
 
+Model metadata is merged from two Lemonade endpoints:
+- `/api/v1/models` supplies the available model list and theoretical `max_context_window`.
+- `/api/v1/health` supplies currently loaded models and their runtime `recipe_options.ctx_size`.
+
+When `ctx_size` is available for a loaded model, the extension reports that as Pi's `contextWindow`. Unloaded models, or recipes that do not expose `ctx_size`, use a conservative fallback (`8192`) rather than the theoretical maximum so Pi does not send prompts the loaded backend will reject.
+
 ## Project layout
 
 ```
@@ -108,6 +115,8 @@ lemonade-pi-plugin/
 **Models don't appear in the picker after login.** Run `/lemonade refresh`. If still empty, check `/lemonade models` — if the server reports models there but Pi doesn't show them, your provider model list might be stale; a full Pi restart will re-trigger the OAuth refresh.
 
 **API key isn't being sent.** Re-run `/login` and pick Lemonade again, paste the key when prompted. Verify with `/lemonade status` — if it returns 401, the key is wrong; if it returns the server health, you're authenticated.
+
+**`Stream ended without finish_reason`.** If Lemonade rejects an oversized prompt, some versions return HTTP 200 with `Content-Type: text/event-stream` but a raw JSON error body such as `exceed_context_size_error`. Check `/lemonade status` for the loaded model's `(ctx N)` value, reload the model with a larger context, then run `/lemonade refresh`. Unloaded models are advertised conservatively until their runtime `ctx_size` can be read from `/api/v1/health`.
 
 ## License
 

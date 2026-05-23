@@ -25,6 +25,12 @@
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-ai": "*"
   },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  },
+  "scripts": {
+    "test": "node --import tsx scripts/test-qwen-mapping.mjs"
+  },
   "pi": {
     "extensions": ["extensions/index.ts"]
   }

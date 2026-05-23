@@ -53,14 +53,29 @@ const BEACON_PORT = 13305;
 const HTTP_FALLBACK_PORTS = [13305, 8000, 1234, 9000, 8080];
 const DEFAULT_HTTP_URL = "http://localhost:13305";
 const CREDS_TTL_MS = 24 * 60 * 60 * 1000;
+// Conservative fallback for models whose loaded runtime context is unknown.
+// Lemonade's /api/v1/models max_context_window is a theoretical model limit,
+// not the actual ctx_size of the currently loaded backend.
+const DEFAULT_CONTEXT_WINDOW = 8192;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
+
+interface LemonadeLoadedModelInfo {
+  backend_url?: string;
+  checkpoint?: string;
+  device?: string;
+  last_use?: number;
+  model_name?: string;
+  recipe?: string;
+  recipe_options?: Record<string, unknown>;
+  type?: string;
+}
 
 interface LemonadeHealth {
   status: string;
   version: string;
   model_loaded: string | null;
-  all_models_loaded?: string[] | null;
+  all_models_loaded?: (string | LemonadeLoadedModelInfo)[] | null;
   websocket_port?: number;
 }
 
@@ -72,7 +87,28 @@ interface LemonadeModelInfo {
   recipe?: string;
   loaded?: boolean;
   size?: number;
+  labels?: string[];
+  max_context_window?: number;
   config?: Record<string, unknown>;
+}
+
+interface ProviderModel {
+  id: string;
+  name: string;
+  reasoning: boolean;
+  input: ("text" | "image")[];
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  contextWindow: number;
+  maxTokens: number;
+  thinkingLevelMap?: Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh", string | null>>;
+  // Subset of Pi's OpenAICompletionsCompat. Kept local because the
+  // @earendil-works/pi-ai peerDep is not installed in extensions/. Shape
+  // mirrors upstream types.ts on main.
+  compat?: {
+    thinkingFormat?: "qwen" | "qwen-chat-template";
+    supportsReasoningEffort?: boolean;
+    requiresReasoningContentOnAssistantMessages?: boolean;
+  };
 }
 
 interface OAuthCredentials {
@@ -239,6 +275,153 @@ async function discoverServers(timeoutMs = 2500): Promise<BeaconResult[]> {
 
 // ─── HTTP calls ─────────────────────────────────────────────────────────────
 
+// Lemonade's streaming chat-completions endpoint sometimes returns HTTP 200 +
+// `Content-Type: text/event-stream` with a body that is *not* SSE-framed but a
+// raw JSON error object (e.g. `exceed_context_size_error`). Pi's openai-
+// completions provider then sees a stream that ends with no `finish_reason` and
+// surfaces a generic "stream ended without finish_reason" — the user gets a
+// silent dead session with no actionable signal.
+//
+// To turn that into a proper exception we have to inspect the response body.
+// Pi's extension surface gives us no clean place to do that (as of pi 0.75.4):
+//
+//   - ProviderConfig has no `fetch` field; Pi instantiates the OpenAI SDK
+//     directly in openai-completions.ts without forwarding a custom fetch.
+//   - The `after_provider_response` event exposes `{ status, headers }` only —
+//     the response body / stream is not passed to extensions.
+//   - `streamSimple` would replace the entire streaming implementation for the
+//     provider, requiring us to reimplement message conversion, tool calls,
+//     qwen-chat-template kwargs, cache handling, etc. — far too invasive.
+//
+// So we wrap `globalThis.fetch`. The wrapper:
+//   - is installed lazily on the first `trackChatCompletionUrl` call (no
+//     mutation when the plugin loads but the user never connects),
+//   - is idempotent across module re-loads via a Symbol.for guard,
+//   - short-circuits to the original fetch for any URL not on the tracked set
+//     (only this plugin's chat-completions endpoint is inspected).
+//
+// Follow-up tracked in TASKS.org: raise an upstream Pi feature request for a
+// per-provider fetch hook or a body-aware response interceptor so we can drop
+// the global mutation.
+
+const TRACKED_CHAT_COMPLETION_URLS = Symbol.for("lemonade-pi-plugin.trackedChatCompletionUrls");
+const FETCH_WRAPPER_INSTALLED = Symbol.for("lemonade-pi-plugin.fetchWrapperInstalled");
+const trackedChatCompletionUrls = (((globalThis as Record<symbol, unknown>)[TRACKED_CHAT_COMPLETION_URLS] ??=
+  new Set<string>()) as Set<string>);
+
+function trackChatCompletionUrl(baseUrl: string): void {
+  if (!baseUrl) return;
+  trackedChatCompletionUrls.add(`${baseUrl.replace(/\/+$/, "")}/v1/chat/completions`);
+  // Lazy install: the wrapper only matters once we have at least one tracked
+  // URL to inspect. Repeated calls are no-ops thanks to FETCH_WRAPPER_INSTALLED.
+  installLemonadeFetchErrorWrapper();
+}
+
+function requestUrl(input: unknown): string | null {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.href;
+  if (input instanceof Request) return input.url;
+  return null;
+}
+
+function isTrackedChatCompletionRequest(input: unknown): boolean {
+  const raw = requestUrl(input);
+  if (!raw) return false;
+  try {
+    const url = new URL(raw);
+    for (const tracked of trackedChatCompletionUrls) {
+      const target = new URL(tracked);
+      if (url.origin === target.origin && url.pathname === target.pathname) return true;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+function formatLemonadeError(payload: unknown): string | null {
+  if (!payload || typeof payload !== "object") return null;
+  const rawError = (payload as { error?: unknown }).error;
+  if (!rawError || typeof rawError !== "object") return null;
+  const error = rawError as Record<string, unknown>;
+  const code = error.code;
+  const message = error.message;
+  const type = error.type;
+  if (typeof message !== "string" || message.length === 0) return null;
+  const prefix =
+    type === "exceed_context_size_error" ? "context_length_exceeded: " : "Lemonade API error: ";
+  const parts = [
+    typeof type === "string" ? type : undefined,
+    typeof code === "number" || typeof code === "string" ? `code=${code}` : undefined,
+  ].filter(Boolean);
+  const details = parts.length > 0 ? ` (${parts.join(", ")})` : "";
+  const tokenDetails =
+    typeof error.n_prompt_tokens === "number" && typeof error.n_ctx === "number"
+      ? `; prompt tokens=${error.n_prompt_tokens}, ctx=${error.n_ctx}`
+      : "";
+  return `${prefix}${message}${details}${tokenDetails}`;
+}
+
+async function readSseJsonError(response: Response): Promise<string | null> {
+  if (!response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) return null;
+  const reader = response.clone().body?.getReader();
+  if (!reader) return null;
+
+  const timeout = Symbol("timeout");
+  const first = await Promise.race([
+    reader.read(),
+    new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 250)),
+  ]);
+  if (first === timeout) {
+    await reader.cancel().catch(() => undefined);
+    return null;
+  }
+  if (first.done || !first.value) {
+    await reader.cancel().catch(() => undefined);
+    return null;
+  }
+
+  const decoder = new TextDecoder();
+  let text = decoder.decode(first.value, { stream: true });
+  if (!text.trimStart().startsWith("{")) {
+    await reader.cancel().catch(() => undefined);
+    return null;
+  }
+
+  while (true) {
+    const next = await Promise.race([
+      reader.read(),
+      new Promise<typeof timeout>((resolve) => setTimeout(() => resolve(timeout), 250)),
+    ]);
+    if (next === timeout) break;
+    if (next.done) break;
+    text += decoder.decode(next.value, { stream: true });
+  }
+  text += decoder.decode();
+
+  try {
+    return formatLemonadeError(JSON.parse(text));
+  } catch {
+    return null;
+  } finally {
+    await reader.cancel().catch(() => undefined);
+  }
+}
+
+function installLemonadeFetchErrorWrapper(): void {
+  const globalSymbols = globalThis as Record<symbol, unknown>;
+  if (globalSymbols[FETCH_WRAPPER_INSTALLED] || typeof fetch !== "function") return;
+  globalSymbols[FETCH_WRAPPER_INSTALLED] = true;
+  const originalFetch = fetch.bind(globalThis);
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const response = await originalFetch(input, init);
+    if (!isTrackedChatCompletionRequest(input)) return response;
+    const message = await readSseJsonError(response);
+    if (message) throw new Error(message);
+    return response;
+  }) as typeof fetch;
+}
+
 async function checkHealth(baseUrl: string, apiKey?: string): Promise<LemonadeHealth | null> {
   try {
     const res = await fetch(`${baseUrl}/api/v1/health`, {
@@ -268,32 +451,118 @@ async function fetchModels(baseUrl: string, apiKey?: string): Promise<LemonadeMo
 
 // ─── Provider model mapping ─────────────────────────────────────────────────
 
-function isReasoningModel(recipe: string | undefined): boolean {
-  if (!recipe) return false;
-  const r = recipe.toLowerCase();
-  return ["qwq", "deepseek-r1", "r1", "o1", "o3", "think"].some((t) => r.includes(t));
+function modelHasLabel(m: LemonadeModelInfo, label: string): boolean {
+  return (m.labels ?? []).some((l) => l.toLowerCase() === label);
 }
 
-function mapToProviderModel(m: LemonadeModelInfo) {
+function isReasoningModel(m: LemonadeModelInfo): boolean {
+  // Lemonade's OpenAI-compatible /v1/models response marks reasoning-capable
+  // models with labels: ["reasoning"]. Model ids/checkpoints are not a stable
+  // capability signal.
+  return modelHasLabel(m, "reasoning");
+}
+
+// Match any model whose id or name contains "qwen" (case-insensitive).
+// Intentionally ignores Lemonade's reasoning label: the qwen-chat-template
+// workaround for upstream Pi issue #4862 must apply to every Qwen model
+// regardless of how Lemonade tags it. False positives (e.g. qwen-coder,
+// qwen-vl) get the thinking-control UI but Lemonade will ignore unknown
+// chat_template_kwargs, so requests still succeed.
+function isQwenModel(m: LemonadeModelInfo): boolean {
+  return /qwen/i.test(m.id ?? "") || /qwen/i.test(m.name ?? "");
+}
+
+type LoadedContextWindows = Map<string, number>;
+
+function asPositiveInteger(value: unknown): number | undefined {
+  const n = typeof value === "string" ? Number(value) : value;
+  if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return undefined;
+  return Math.floor(n);
+}
+
+function loadedContextWindowsFromHealth(health: LemonadeHealth | null | undefined): LoadedContextWindows {
+  const windows: LoadedContextWindows = new Map();
+  for (const loaded of health?.all_models_loaded ?? []) {
+    if (!loaded || typeof loaded !== "object") continue;
+    const ctxSize = asPositiveInteger(loaded.recipe_options?.ctx_size);
+    if (!ctxSize) continue;
+    const names = [loaded.model_name, loaded.checkpoint].filter(
+      (name): name is string => typeof name === "string" && name.length > 0,
+    );
+    for (const name of names) windows.set(name, ctxSize);
+  }
+  return windows;
+}
+
+function loadedContextWindowForModel(
+  m: LemonadeModelInfo,
+  loadedContextWindows?: LoadedContextWindows,
+): number | undefined {
+  return loadedContextWindows?.get(m.id) ?? (m.name ? loadedContextWindows?.get(m.name) : undefined);
+}
+
+function mapToProviderModel(m: LemonadeModelInfo, loadedContextWindows?: LoadedContextWindows): ProviderModel {
   const input: ("text" | "image")[] = ["text"];
   if (m.category === "image" || (m.backend ?? "").toLowerCase().includes("sd")) {
     input.push("image");
   }
   const cfg = m.config ?? {};
   const contextWindow =
-    (cfg["context_window"] as number) ?? (cfg["context_len"] as number) ?? 128000;
+    loadedContextWindowForModel(m, loadedContextWindows) ??
+    asPositiveInteger(cfg["context_window"]) ??
+    asPositiveInteger(cfg["context_len"]) ??
+    DEFAULT_CONTEXT_WINDOW;
   const maxTokens =
-    (cfg["max_new_tokens"] as number) ?? (cfg["max_tokens"] as number) ?? 4096;
-  return {
+    asPositiveInteger(cfg["max_new_tokens"]) ?? asPositiveInteger(cfg["max_tokens"]) ?? 4096;
+  const isReasoning = isReasoningModel(m);
+  const isQwen = isQwenModel(m);
+  const result: ProviderModel = {
     id: m.id,
+    // Force reasoning:true for any Qwen model so Pi's openai-completions
+    // qwen-chat-template branch (gated on model.reasoning) emits
+    // chat_template_kwargs. See upstream Pi issue #4862 + PR #2769.
     name: m.name || m.id,
-    reasoning: isReasoningModel(m.recipe),
+    reasoning: isReasoning || isQwen,
     input,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow,
     maxTokens,
   };
+  // Qwen models use binary `enable_thinking` via chat_template_kwargs.
+  // Expose only off/high in Pi's UI rather than advertising several levels
+  // that all collapse to truthy/falsy at the wire.
+  if (isQwen) {
+    result.thinkingLevelMap = {
+      minimal: null,
+      low: null,
+      medium: null,
+      xhigh: null,
+    };
+    // qwen-chat-template makes Pi send
+    //   chat_template_kwargs: { enable_thinking, preserve_thinking: true }
+    // instead of top-level reasoning_effort / enable_thinking, which is what
+    // Lemonade actually honors (Pi issue #4862).
+    // requiresReasoningContentOnAssistantMessages preserves reasoning_content
+    // on assistant turns so multi-turn Qwen sessions don't degrade once
+    // preserve_thinking is in play (Pi PR #2769, issue #4526).
+    result.compat = {
+      thinkingFormat: "qwen-chat-template",
+      requiresReasoningContentOnAssistantMessages: true,
+    };
+  }
+  return result;
 }
+
+// Exported for the synthetic-model test harness under scripts/.
+export const __test__ = {
+  DEFAULT_CONTEXT_WINDOW,
+  formatLemonadeError,
+  readSseJsonError,
+  loadedContextWindowsFromHealth,
+  mapToProviderModel,
+  isQwenModel,
+  isReasoningModel,
+};
 
 // ─── Provider (re-)registration ─────────────────────────────────────────────
 
@@ -303,10 +572,14 @@ async function registerLemonadeProvider(
   oauthBlock: unknown,
 ): Promise<number> {
   const baseUrl = payload?.baseUrl ?? "";
-  let providerModels: ReturnType<typeof mapToProviderModel>[] = [];
+  let providerModels: ProviderModel[] = [];
   if (baseUrl) {
-    const raw = await fetchModels(baseUrl, payload?.apiKey);
-    providerModels = raw.map(mapToProviderModel);
+    const [raw, health] = await Promise.all([
+      fetchModels(baseUrl, payload?.apiKey),
+      checkHealth(baseUrl, payload?.apiKey),
+    ]);
+    const loadedContextWindows = loadedContextWindowsFromHealth(health);
+    providerModels = raw.map((m) => mapToProviderModel(m, loadedContextWindows));
   }
 
   try {
@@ -314,6 +587,8 @@ async function registerLemonadeProvider(
   } catch {
     // not previously registered; ignore
   }
+
+  if (baseUrl) trackChatCompletionUrl(baseUrl);
 
   const config: Record<string, unknown> = {
     name: payload?.serverName ? `Lemonade (${payload.serverName})` : "Lemonade",
@@ -449,6 +724,12 @@ async function readStoredPayload(): Promise<CredsPayload | null> {
   return null;
 }
 
+function loadedModelName(loaded: string | LemonadeLoadedModelInfo): string {
+  if (typeof loaded === "string") return loaded;
+  const ctxSize = asPositiveInteger(loaded.recipe_options?.ctx_size);
+  return `${loaded.model_name ?? loaded.checkpoint ?? "unknown"}${ctxSize ? ` (ctx ${ctxSize})` : ""}`;
+}
+
 function registerAdminCommand(pi: ExtensionAPI, oauthBlock: unknown) {
   pi.registerCommand("lemonade", {
     description: "Lemonade server administration (status, models, load/pull/delete)",
@@ -510,7 +791,7 @@ function registerAdminCommand(pi: ExtensionAPI, oauthBlock: unknown) {
             `Lemonade v${h.version} @ ${baseUrl}\n` +
               `Status: ${h.status}\n` +
               `Loaded: ${h.model_loaded ?? "(none)"}\n` +
-              `All loaded: ${(h.all_models_loaded ?? []).join(", ") || "(none)"}` +
+              `All loaded: ${(h.all_models_loaded ?? []).map(loadedModelName).join(", ") || "(none)"}` +
               (h.websocket_port ? `\nWebSocket port: ${h.websocket_port}` : ""),
             "info",
           );
@@ -644,6 +925,10 @@ async function postModelOp(
 // ─── Extension factory ──────────────────────────────────────────────────────
 
 export default async function lemonadeProvider(pi: ExtensionAPI) {
+  // installLemonadeFetchErrorWrapper() runs lazily inside trackChatCompletionUrl
+  // once a real Lemonade baseUrl is registered. No global fetch mutation happens
+  // at module load if the user never logs in.
+
   const oauthBlock = {
     name: PROVIDER_LABEL,
     login: (callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> =>
