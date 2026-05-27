@@ -33,6 +33,10 @@ interface ExtensionAPI {
       handler: (args: string, ctx: PiCommandContext) => Promise<void>;
     },
   ): void;
+  on(
+    event: "before_provider_request",
+    handler: (event: { payload: unknown }, ctx: PiProviderRequestContext) => Promise<void> | void,
+  ): void;
 }
 
 interface PiCommandContext {
@@ -41,6 +45,11 @@ interface PiCommandContext {
     input?(prompt: string, placeholder?: string): Promise<string>;
     select?<T>(prompt: string, options: T[]): Promise<T>;
   };
+  signal?: AbortSignal;
+}
+
+interface PiProviderRequestContext {
+  model?: { provider?: string; id?: string };
   signal?: AbortSignal;
 }
 
@@ -53,9 +62,11 @@ const BEACON_PORT = 13305;
 const HTTP_FALLBACK_PORTS = [13305, 8000, 1234, 9000, 8080];
 const DEFAULT_HTTP_URL = "http://localhost:13305";
 const CREDS_TTL_MS = 24 * 60 * 60 * 1000;
-// Conservative fallback for models whose loaded runtime context is unknown.
-// Lemonade's /api/v1/models max_context_window is a theoretical model limit,
-// not the actual ctx_size of the currently loaded backend.
+const LOAD_TIMEOUT_MS = 10 * 60 * 1000;
+// Conservative fallback for models whose context metadata is unknown. When
+// Lemonade reports max_context_window for a model, we use that as the default
+// and explicitly pass it as ctx_size when loading via /api/v1/load so the
+// backend does not fall back to Lemonade's hardcoded 4k default.
 const DEFAULT_CONTEXT_WINDOW = 8192;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -133,6 +144,12 @@ interface BeaconResult {
   hostname: string;
   baseUrl: string;
 }
+
+type LemonadeModelIndex = Map<string, LemonadeModelInfo>;
+
+let currentPayload: CredsPayload | null = null;
+let currentModelsById: LemonadeModelIndex = new Map();
+const inFlightLoads = new Map<string, Promise<void>>();
 
 // ─── Credential encoding ────────────────────────────────────────────────────
 
@@ -474,6 +491,8 @@ function isQwenModel(m: LemonadeModelInfo): boolean {
 
 type LoadedContextWindows = Map<string, number>;
 
+const CONTEXT_SIZE_RECIPES = new Set(["llamacpp", "flm", "ryzenai-llm"]);
+
 function asPositiveInteger(value: unknown): number | undefined {
   const n = typeof value === "string" ? Number(value) : value;
   if (typeof n !== "number" || !Number.isFinite(n) || n <= 0) return undefined;
@@ -501,6 +520,26 @@ function loadedContextWindowForModel(
   return loadedContextWindows?.get(m.id) ?? (m.name ? loadedContextWindows?.get(m.name) : undefined);
 }
 
+function recipeSupportsContextSize(recipe: string | undefined): boolean {
+  return !recipe || CONTEXT_SIZE_RECIPES.has(recipe);
+}
+
+function maxContextWindowForModel(m: LemonadeModelInfo | undefined): number | undefined {
+  return asPositiveInteger(m?.max_context_window);
+}
+
+function loadRequestBodyForModel(
+  modelName: string,
+  modelInfo: LemonadeModelInfo | undefined,
+): Record<string, unknown> {
+  const body: Record<string, unknown> = { model_name: modelName };
+  const maxContextWindow = maxContextWindowForModel(modelInfo);
+  if (maxContextWindow && recipeSupportsContextSize(modelInfo?.recipe)) {
+    body.ctx_size = maxContextWindow;
+  }
+  return body;
+}
+
 function mapToProviderModel(m: LemonadeModelInfo, loadedContextWindows?: LoadedContextWindows): ProviderModel {
   const input: ("text" | "image")[] = ["text"];
   if (m.category === "image" || (m.backend ?? "").toLowerCase().includes("sd")) {
@@ -508,6 +547,7 @@ function mapToProviderModel(m: LemonadeModelInfo, loadedContextWindows?: LoadedC
   }
   const cfg = m.config ?? {};
   const contextWindow =
+    maxContextWindowForModel(m) ??
     loadedContextWindowForModel(m, loadedContextWindows) ??
     asPositiveInteger(cfg["context_window"]) ??
     asPositiveInteger(cfg["context_len"]) ??
@@ -559,7 +599,10 @@ export const __test__ = {
   formatLemonadeError,
   readSseJsonError,
   loadedContextWindowsFromHealth,
+  loadRequestBodyForModel,
   mapToProviderModel,
+  maxContextWindowForModel,
+  recipeSupportsContextSize,
   isQwenModel,
   isReasoningModel,
 };
@@ -573,11 +616,14 @@ async function registerLemonadeProvider(
 ): Promise<number> {
   const baseUrl = payload?.baseUrl ?? "";
   let providerModels: ProviderModel[] = [];
+  currentPayload = payload;
+  currentModelsById = new Map();
   if (baseUrl) {
     const [raw, health] = await Promise.all([
       fetchModels(baseUrl, payload?.apiKey),
       checkHealth(baseUrl, payload?.apiKey),
     ]);
+    currentModelsById = new Map(raw.map((m) => [m.id, m]));
     const loadedContextWindows = loadedContextWindowsFromHealth(health);
     providerModels = raw.map((m) => mapToProviderModel(m, loadedContextWindows));
   }
@@ -602,6 +648,74 @@ async function registerLemonadeProvider(
   }
   pi.registerProvider(PROVIDER_ID, config);
   return providerModels.length;
+}
+
+function providerRequestModelId(payload: unknown, ctx: PiProviderRequestContext): string | null {
+  if (ctx.model?.provider === PROVIDER_ID && typeof ctx.model.id === "string") {
+    return ctx.model.id;
+  }
+  if (!payload || typeof payload !== "object") return null;
+  const model = (payload as { model?: unknown }).model;
+  return typeof model === "string" && currentModelsById.has(model) ? model : null;
+}
+
+async function refreshModelIndex(baseUrl: string, apiKey?: string): Promise<void> {
+  const models = await fetchModels(baseUrl, apiKey);
+  currentModelsById = new Map(models.map((m) => [m.id, m]));
+}
+
+async function ensureModelLoadedWithMaxContext(
+  baseUrl: string,
+  apiKey: string | undefined,
+  modelName: string,
+): Promise<void> {
+  let modelInfo = currentModelsById.get(modelName);
+  if (!modelInfo || !maxContextWindowForModel(modelInfo)) {
+    await refreshModelIndex(baseUrl, apiKey);
+    modelInfo = currentModelsById.get(modelName);
+  }
+
+  const body = loadRequestBodyForModel(modelName, modelInfo);
+  if (typeof body.ctx_size !== "number") return;
+
+  const key = `${baseUrl}\n${modelName}\n${body.ctx_size}`;
+  const existing = inFlightLoads.get(key);
+  if (existing) return existing;
+
+  const load = (async () => {
+    const response = await fetch(`${baseUrl}/api/v1/load`, {
+      method: "POST",
+      headers: authHeaders(apiKey),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(LOAD_TIMEOUT_MS),
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}) as Record<string, unknown>);
+      const message = extractErrorMessage(data) ?? response.statusText;
+      throw new Error(`Failed to load ${modelName} with ctx_size=${body.ctx_size}: ${message}`);
+    }
+  })();
+
+  inFlightLoads.set(key, load);
+  try {
+    await load;
+  } finally {
+    inFlightLoads.delete(key);
+  }
+}
+
+async function ensureRequestModelLoadedWithMaxContext(event: { payload: unknown }, ctx: PiProviderRequestContext): Promise<void> {
+  const modelName = providerRequestModelId(event.payload, ctx);
+  if (!modelName) return;
+
+  let payload = currentPayload;
+  if (!payload?.baseUrl) {
+    payload = await readStoredPayload();
+    currentPayload = payload;
+  }
+  if (!payload?.baseUrl) return;
+
+  await ensureModelLoadedWithMaxContext(payload.baseUrl, payload.apiKey || undefined, modelName);
 }
 
 // ─── OAuth login flow (runs when user picks "Lemonade" in /login) ───────────
@@ -824,8 +938,16 @@ function registerAdminCommand(pi: ExtensionAPI, oauthBlock: unknown) {
             ctx.ui.notify("Usage: /lemonade load <model_id>", "warning");
             return;
           }
-          ctx.ui.notify(`Loading ${id}…`, "info");
-          await postModelOp(ctx, `${baseUrl}/api/v1/load`, apiKey, { model_name: id }, "load");
+          let modelInfo = currentModelsById.get(id);
+          if (!modelInfo) {
+            const models = await fetchModels(baseUrl, apiKey);
+            currentModelsById = new Map(models.map((m) => [m.id, m]));
+            modelInfo = currentModelsById.get(id);
+          }
+          const body = loadRequestBodyForModel(id, modelInfo);
+          const ctxSuffix = typeof body.ctx_size === "number" ? ` with ctx_size=${body.ctx_size}` : "";
+          ctx.ui.notify(`Loading ${id}${ctxSuffix}…`, "info");
+          await postModelOp(ctx, `${baseUrl}/api/v1/load`, apiKey, body, "load");
           return;
         }
 
@@ -889,6 +1011,15 @@ function registerAdminCommand(pi: ExtensionAPI, oauthBlock: unknown) {
   });
 }
 
+function extractErrorMessage(data: Record<string, unknown>): string | undefined {
+  const error = data.error;
+  if (error && typeof error === "object") {
+    const message = (error as { message?: unknown }).message;
+    if (typeof message === "string") return message;
+  }
+  return typeof error === "string" ? error : undefined;
+}
+
 async function postModelOp(
   ctx: { ui: { notify(msg: string, level?: string): void } },
   url: string,
@@ -901,15 +1032,11 @@ async function postModelOp(
       method: "POST",
       headers: authHeaders(apiKey),
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(60_000),
+      signal: AbortSignal.timeout(label === "load" ? LOAD_TIMEOUT_MS : 60_000),
     });
     const data = await r.json().catch(() => ({}) as Record<string, unknown>);
     if (!r.ok) {
-      const msg =
-        (data as { error?: { message?: string } | string })?.error &&
-        typeof (data as { error?: { message?: string } }).error === "object"
-          ? (data as { error: { message?: string } }).error.message
-          : ((data as { error?: string }).error ?? r.statusText);
+      const msg = extractErrorMessage(data) ?? r.statusText;
       ctx.ui.notify(`${label} failed: ${msg}`, "error");
       return;
     }
@@ -928,6 +1055,8 @@ export default async function lemonadeProvider(pi: ExtensionAPI) {
   // installLemonadeFetchErrorWrapper() runs lazily inside trackChatCompletionUrl
   // once a real Lemonade baseUrl is registered. No global fetch mutation happens
   // at module load if the user never logs in.
+
+  pi.on("before_provider_request", ensureRequestModelLoadedWithMaxContext);
 
   const oauthBlock = {
     name: PROVIDER_LABEL,

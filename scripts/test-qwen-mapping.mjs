@@ -21,6 +21,7 @@ const {
   formatLemonadeError,
   readSseJsonError,
   loadedContextWindowsFromHealth,
+  loadRequestBodyForModel,
   mapToProviderModel,
 } = mod.__test__;
 
@@ -89,7 +90,7 @@ test("case-insensitive matching: lowercase qwen in id triggers compat", () => {
   assert.equal(out.compat?.thinkingFormat, "qwen-chat-template");
 });
 
-test("loaded health ctx_size overrides theoretical max_context_window", () => {
+test("max_context_window is the registered contextWindow default", () => {
   const windows = loadedContextWindowsFromHealth({
     status: "ok",
     version: "10.6.0",
@@ -107,15 +108,15 @@ test("loaded health ctx_size overrides theoretical max_context_window", () => {
     mk({ id: "Qwen3-Coder-Next-GGUF-Q4_K_M", max_context_window: 262144 }),
     windows,
   );
-  assert.equal(out.contextWindow, 4096);
+  assert.equal(out.contextWindow, 262144);
 });
 
-test("unloaded models do not trust theoretical max_context_window", () => {
+test("unloaded models use theoretical max_context_window", () => {
   const out = mapToProviderModel(mk({ max_context_window: 262144 }));
-  assert.equal(out.contextWindow, DEFAULT_CONTEXT_WINDOW);
+  assert.equal(out.contextWindow, 262144);
 });
 
-test("string ctx_size in health is accepted", () => {
+test("models without max_context_window fall back to loaded health ctx_size", () => {
   const windows = loadedContextWindowsFromHealth({
     status: "ok",
     version: "10.6.0",
@@ -133,6 +134,30 @@ test("string ctx_size in health is accepted", () => {
     windows,
   );
   assert.equal(out.contextWindow, 32768);
+});
+
+test("models without max_context_window or loaded ctx_size use conservative fallback", () => {
+  const out = mapToProviderModel(mk({ max_context_window: undefined }));
+  assert.equal(out.contextWindow, DEFAULT_CONTEXT_WINDOW);
+});
+
+test("load request includes max_context_window as ctx_size for context-size recipes", () => {
+  const body = loadRequestBodyForModel(
+    "Qwen3-Coder-Next-GGUF-Q4_K_M",
+    mk({ id: "Qwen3-Coder-Next-GGUF-Q4_K_M", recipe: "llamacpp", max_context_window: 262144 }),
+  );
+  assert.deepEqual(body, {
+    model_name: "Qwen3-Coder-Next-GGUF-Q4_K_M",
+    ctx_size: 262144,
+  });
+});
+
+test("load request omits ctx_size for recipes that do not support it", () => {
+  const body = loadRequestBodyForModel(
+    "stable-diffusion-xl",
+    mk({ id: "stable-diffusion-xl", recipe: "sd-cpp", max_context_window: 262144 }),
+  );
+  assert.deepEqual(body, { model_name: "stable-diffusion-xl" });
 });
 
 test("Lemonade context overflow error is normalized for pi auto-compaction", () => {

@@ -11,7 +11,7 @@ After install, type `/login` in Pi then `subscription` and pick **Lemonade**, le
 - **HTTP fallback** — scans `localhost:13305`, `1234`, `9000`, `8080` if no beacon arrives.
 - **API key support** — prompted during login, stored by Pi in `~/.pi/agent/auth.json`, sent as `Authorization: Bearer …` on every request.
 - **Model admin** — `/lemonade` for status, list, load, unload, pull, delete, refresh, discover.
-- **Loaded context-window reporting** — for loaded Lemonade models, Pi's `contextWindow` uses `/api/v1/health` runtime `recipe_options.ctx_size` instead of the theoretical `/api/v1/models[].max_context_window`.
+- **Max context-window loading** — when Pi is about to call a Lemonade model, the extension first ensures the model is loaded through `/api/v1/load` with `ctx_size` set to that model's `/api/v1/models[].max_context_window`, avoiding Lemonade's 4k default.
 
 ## Install
 
@@ -85,10 +85,10 @@ The connection details (`baseUrl`, `apiKey`, `serverName`) are encoded as JSON i
 The Pi-side API call goes through Lemonade's OpenAI-compatible `/v1/chat/completions` endpoint. The extension uses `api: "openai-completions"` in the provider config.
 
 Model metadata is merged from two Lemonade endpoints:
-- `/api/v1/models` supplies the available model list and theoretical `max_context_window`.
-- `/api/v1/health` supplies currently loaded models and their runtime `recipe_options.ctx_size`.
+- `/api/v1/models` supplies the available model list and `max_context_window`.
+- `/api/v1/health` supplies currently loaded models and their runtime `recipe_options.ctx_size` when `max_context_window` is absent.
 
-When `ctx_size` is available for a loaded model, the extension reports that as Pi's `contextWindow`. Unloaded models, or recipes that do not expose `ctx_size`, use a conservative fallback (`8192`) rather than the theoretical maximum so Pi does not send prompts the loaded backend will reject.
+For models that report `max_context_window`, the extension registers that value as Pi's `contextWindow`. Immediately before a Lemonade provider request, it calls `/api/v1/load` with `{ model_name, ctx_size: max_context_window }` for context-size-capable recipes (`llamacpp`, `flm`, `ryzenai-llm`). Lemonade treats matching loads as idempotent, while a model that would otherwise auto-load at the hardcoded 4k default is loaded at its maximum supported context instead. Models without `max_context_window` fall back to loaded `ctx_size`, explicit config context fields, then the conservative `8192` default.
 
 ## Project layout
 
@@ -116,7 +116,7 @@ lemonade-pi-plugin/
 
 **API key isn't being sent.** Re-run `/login` and pick Lemonade again, paste the key when prompted. Verify with `/lemonade status` — if it returns 401, the key is wrong; if it returns the server health, you're authenticated.
 
-**`Stream ended without finish_reason`.** If Lemonade rejects an oversized prompt, some versions return HTTP 200 with `Content-Type: text/event-stream` but a raw JSON error body such as `exceed_context_size_error`. Check `/lemonade status` for the loaded model's `(ctx N)` value, reload the model with a larger context, then run `/lemonade refresh`. Unloaded models are advertised conservatively until their runtime `ctx_size` can be read from `/api/v1/health`.
+**`Stream ended without finish_reason`.** If Lemonade rejects an oversized prompt, some versions return HTTP 200 with `Content-Type: text/event-stream` but a raw JSON error body such as `exceed_context_size_error`. The extension attempts to surface that raw Lemonade error and auto-load context-size-capable models with `ctx_size=max_context_window` before provider requests. If you still hit this, check `/lemonade status` for the loaded model's `(ctx N)` value and run `/lemonade refresh` to update Pi's model metadata.
 
 ## License
 
